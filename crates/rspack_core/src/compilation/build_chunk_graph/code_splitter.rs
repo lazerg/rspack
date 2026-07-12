@@ -29,6 +29,10 @@ use crate::{
   merge_runtime,
 };
 
+mod parallel;
+
+use parallel::ParallelCodeSplitterState;
+
 pub(crate) type DependenciesBlockIdentifierMap<V> =
   std::collections::HashMap<DependenciesBlockIdentifier, V, BuildHasherDefault<FxHasher>>;
 pub(crate) type DependenciesBlockIdentifierSet =
@@ -308,6 +312,8 @@ pub(crate) struct CodeSplitter {
   prepared_connection_map: IdentifierMap<PreparedBlockConnectionMap>,
 
   prepared_blocks_map: DependenciesBlockIdentifierMap<Vec<AsyncDependenciesBlockIdentifier>>,
+
+  parallel_state: ParallelCodeSplitterState,
 }
 
 fn add_chunk_in_group(
@@ -964,6 +970,7 @@ Or do you want to use the entrypoints '{name}' and '{runtime}' independently on 
       || !self.queue_connect.is_empty()
       || !self.queue_delayed.is_empty()
       || !self.chunk_groups_for_combining.is_empty()
+      || self.parallel_state.has_pending_work()
     {
       self.process_queue(compilation);
 
@@ -981,6 +988,10 @@ Or do you want to use the entrypoints '{name}' and '{runtime}' independently on 
 
       if !self.outdated_chunk_group_info.is_empty() {
         self.process_outdated_chunk_group_info(compilation);
+      }
+
+      if self.parallel_state.has_pending_work() {
+        parallel::process_parallel_work(self, compilation);
       }
 
       if self.queue.is_empty() {
@@ -1845,6 +1856,7 @@ Or do you want to use the entrypoints '{name}' and '{runtime}' independently on 
           chunk: c.chunks[0],
         }),
       ));
+      self.parallel_state.bump_revision(cgi);
     } else if let Some(entrypoint) = entrypoint {
       let item_chunk_group = compilation
         .build_chunk_graph_artifact
@@ -2345,9 +2357,13 @@ Or do you want to use the entrypoints '{name}' and '{runtime}' independently on 
             continue;
           }
 
-          self
-            .queue_delayed
-            .push(QueueAction::ProcessBlock(process_block));
+          if self.parallel_state.enabled() {
+            self.parallel_state.enqueue(info_ukey, process_block);
+          } else {
+            self
+              .queue_delayed
+              .push(QueueAction::ProcessBlock(process_block));
+          }
         }
       }
     }
@@ -2358,6 +2374,7 @@ Or do you want to use the entrypoints '{name}' and '{runtime}' independently on 
     all_modules: &Vec<ModuleIdentifier>,
     compilation: &Compilation,
   ) -> Result<()> {
+    self.parallel_state.configure_from_env();
     let mg = compilation.get_module_graph();
     self.prepared_connection_map = all_modules
       .par_iter()

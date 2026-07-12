@@ -20,6 +20,8 @@ use serde_json::json;
 use crate::groups::diagnostics::assert_no_compilation_errors;
 
 pub(crate) static NUM_MODULES: usize = 10000;
+const WIDE_CHUNK_GROUPS: usize = 128;
+const WIDE_MODULES_PER_GROUP: usize = 128;
 
 pub(crate) async fn prepare_large_code_splitting_case(
   num: usize,
@@ -37,6 +39,50 @@ pub(crate) async fn prepare_large_code_splitting_case(
       .await
       .unwrap();
   }
+}
+
+async fn prepare_wide_code_splitting_case(
+  groups: usize,
+  modules_per_group: usize,
+  fs: &MemoryFileSystem,
+) {
+  fs.create_dir_all("/src".into()).await.unwrap();
+  fs.create_dir_all("/src/wide".into()).await.unwrap();
+
+  let mut entry = String::new();
+  for group in 0..groups {
+    entry.push_str(&format!("import('/src/wide/group-{group}.js');\n"));
+    let mut group_source = String::new();
+    for module in 0..modules_per_group {
+      let module_id = group * modules_per_group + module;
+      group_source.push_str(&format!(
+        "import value{module} from '/src/wide/leaf-{module_id}.js';\n"
+      ));
+      fs.write(
+        format!("/src/wide/leaf-{module_id}.js").as_str().into(),
+        format!("export default {module_id};").as_bytes(),
+      )
+      .await
+      .unwrap();
+    }
+    group_source.push_str("export default ");
+    group_source.push_str(
+      &(0..modules_per_group)
+        .map(|module| format!("value{module}"))
+        .collect::<Vec<_>>()
+        .join(" + "),
+    );
+    group_source.push_str(";\n");
+    fs.write(
+      format!("/src/wide/group-{group}.js").as_str().into(),
+      group_source.as_bytes(),
+    )
+    .await
+    .unwrap();
+  }
+  fs.write("/src/wide-entry.js".into(), entry.as_bytes())
+    .await
+    .unwrap();
 }
 
 fn gen_static_leaf_module(index: usize, ctx: &mut Vec<(String, String)>) {
@@ -196,10 +242,41 @@ pub fn build_chunk_graph_benchmark_inner(c: &mut Criterion) {
     compiler.compilation.exports_info_artifact = exports_info_artifact.into();
   });
 
+  register_build_chunk_graph_benchmark(c, "rust@build_chunk_graph", compiler, NUM_MODULES / 10);
+
+  let wide_fs = Arc::new(MemoryFileSystem::default());
+  let mut wide_compiler = Compiler::builder()
+    .context("/")
+    .entry("main", "/src/wide-entry.js")
+    .input_filesystem(wide_fs.clone())
+    .output_filesystem(wide_fs.clone())
+    .optimization(Optimization::builder())
+    .incremental(IncrementalOptions::empty_passes())
+    .build()
+    .unwrap();
+  reset_compilation_state(&mut wide_compiler);
+  rt.block_on(async {
+    prepare_wide_code_splitting_case(WIDE_CHUNK_GROUPS, WIDE_MODULES_PER_GROUP, &wide_fs).await;
+    prepare_chunk_graph_compilation(&mut wide_compiler).await;
+  });
+  register_build_chunk_graph_benchmark(
+    c,
+    "rust@build_chunk_graph_wide",
+    wide_compiler,
+    WIDE_CHUNK_GROUPS + 1,
+  );
+}
+
+fn register_build_chunk_graph_benchmark(
+  c: &mut Criterion,
+  name: &'static str,
+  compiler: Compiler,
+  expected_chunks: usize,
+) {
   assert_no_compilation_errors(&compiler.compilation, "build_chunk_graph benchmark setup");
   let compiler = RefCell::new(compiler);
 
-  c.bench_function("rust@build_chunk_graph", |b| {
+  c.bench_function(name, |b| {
     b.iter_batched_ref(
       || {
         let mut compiler = compiler.borrow_mut();
@@ -215,12 +292,75 @@ pub fn build_chunk_graph_benchmark_inner(c: &mut Criterion) {
             .build_chunk_graph_artifact
             .chunk_by_ukey
             .len(),
-          NUM_MODULES / 10
+          expected_chunks
         );
       },
       BatchSize::PerIteration,
     );
   });
+}
+
+async fn prepare_chunk_graph_compilation(compiler: &mut Compiler) {
+  let mut compilation_params = compiler.new_compilation_params();
+  compiler
+    .plugin_driver
+    .compiler_hooks
+    .this_compilation
+    .call(&mut compiler.compilation, &mut compilation_params)
+    .await
+    .unwrap();
+  compiler
+    .plugin_driver
+    .compiler_hooks
+    .compilation
+    .call(&mut compiler.compilation, &mut compilation_params)
+    .await
+    .unwrap();
+  compiler
+    .plugin_driver
+    .compiler_hooks
+    .make
+    .call(&mut compiler.compilation)
+    .await
+    .unwrap();
+  build_module_graph_pass(&mut compiler.compilation)
+    .await
+    .unwrap();
+
+  let mut side_effects_optimize_artifact =
+    compiler.compilation.side_effects_optimize_artifact.steal();
+  let mut diagnostics: Vec<Diagnostic> = vec![];
+  let mut build_module_graph_artifact = compiler.compilation.build_module_graph_artifact.steal();
+  let mut exports_info_artifact = compiler.compilation.exports_info_artifact.steal();
+  while matches!(
+    compiler
+      .plugin_driver
+      .compilation_hooks
+      .optimize_dependencies
+      .call(
+        &compiler.compilation,
+        &mut side_effects_optimize_artifact,
+        &mut build_module_graph_artifact,
+        &mut exports_info_artifact,
+        &mut diagnostics
+      )
+      .await
+      .unwrap(),
+    Some(true)
+  ) {}
+  compiler.compilation.build_module_graph_artifact = build_module_graph_artifact.into();
+  compiler.compilation.exports_info_artifact = exports_info_artifact.into();
+  compiler.compilation.side_effects_optimize_artifact = side_effects_optimize_artifact.into();
+  compiler.compilation.extend_diagnostics(diagnostics);
+
+  let make_artifact = compiler.compilation.build_module_graph_artifact.steal();
+  let exports_info_artifact = compiler.compilation.exports_info_artifact.steal();
+  let (make_artifact, exports_info_artifact) =
+    finish_build_module_graph(&compiler.compilation, make_artifact, exports_info_artifact)
+      .await
+      .unwrap();
+  compiler.compilation.build_module_graph_artifact = make_artifact.into();
+  compiler.compilation.exports_info_artifact = exports_info_artifact.into();
 }
 
 pub fn build_module_graph_benchmark(c: &mut Criterion) {
