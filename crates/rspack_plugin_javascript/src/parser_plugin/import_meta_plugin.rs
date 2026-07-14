@@ -5,7 +5,7 @@ use rspack_core::{
   DependencyRange, ImportMeta, ImportMetaKnownProperties, ResolvedModuleOptions, RscMeta,
   RscModuleType, RuntimeGlobals, RuntimeRequirementsDependency, property_access,
 };
-use rspack_error::{Error, Severity};
+use rspack_error::{Error, Label, Severity};
 use rspack_util::SpanExt;
 use swc_atoms::Atom;
 use swc_experimental_ecma_ast::{
@@ -377,22 +377,23 @@ impl ImportMetaPlugin {
     }
 
     let property = if members.is_empty() {
-      "an unknown property of import.meta".to_string()
+      "<computed>".to_string()
     } else {
-      concat_string!("import.meta.", members.join("."))
+      members.join(".")
     };
-    let mut error = create_traceable_error(
-      "Critical dependency".into(),
-      concat_string!(
-        "Accessing ",
-        property,
-        " is unsupported and will be replaced with undefined"
-      )
-      .into(),
-      parser.source.to_string(),
-      span.into(),
-    );
-    error.severity = Severity::Warning;
+    let range: DependencyRange = span.into();
+    let mut error = Error::warning(concat_string!(
+      "Unknown `import.meta` property `",
+      property,
+      "` replaced with undefined."
+    ));
+    error.src = Some(parser.source.to_string());
+    error.labels = Some(vec![Label {
+      name: None,
+      offset: range.start as usize,
+      len: range.end.saturating_sub(range.start) as usize,
+    }]);
+    error.hide_stack = Some(true);
     parser.add_warning(error.into());
   }
 
@@ -687,7 +688,7 @@ impl<'p, 'a> JavascriptParserPlugin<'p, 'a> for ImportMetaPlugin {
               content.push('[');
               content.push_str(&rspack_util::json_stringify_str(&prop.id));
               content.push_str("]: ");
-              content.push_str(&self.import_meta_unknown_property(&vec![prop.id.to_string()]));
+              content.push_str(&self.import_meta_unknown_property(&[prop.id.to_string()]));
             }
           } else if let Some(api) = import_meta_runtime_api_from_property(prop.id.as_ref()) {
             if self.runtime_api_enabled(api)
@@ -698,7 +699,7 @@ impl<'p, 'a> JavascriptParserPlugin<'p, 'a> for ImportMetaPlugin {
               content.push('[');
               content.push_str(&rspack_util::json_stringify_str(&prop.id));
               content.push_str("]: ");
-              content.push_str(&self.import_meta_unknown_property(&vec![prop.id.to_string()]));
+              content.push_str(&self.import_meta_unknown_property(&[prop.id.to_string()]));
             }
           } else {
             let members = vec![prop.id.to_string()];
