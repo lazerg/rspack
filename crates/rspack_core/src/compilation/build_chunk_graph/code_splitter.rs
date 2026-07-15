@@ -970,7 +970,6 @@ Or do you want to use the entrypoints '{name}' and '{runtime}' independently on 
       || !self.queue_connect.is_empty()
       || !self.queue_delayed.is_empty()
       || !self.chunk_groups_for_combining.is_empty()
-      || self.parallel_state.has_pending_work()
     {
       self.process_queue(compilation);
 
@@ -988,10 +987,6 @@ Or do you want to use the entrypoints '{name}' and '{runtime}' independently on 
 
       if !self.outdated_chunk_group_info.is_empty() {
         self.process_outdated_chunk_group_info(compilation);
-      }
-
-      if self.parallel_state.has_pending_work() {
-        parallel::process_parallel_work(self, compilation);
       }
 
       if self.queue.is_empty() {
@@ -1479,6 +1474,7 @@ Or do you want to use the entrypoints '{name}' and '{runtime}' independently on 
       compilation,
     );
 
+    let discovered_actions_start = self.queue.len();
     for (module, active_state, connections) in block_modules.iter().rev() {
       if compilation
         .build_chunk_graph_artifact
@@ -1532,6 +1528,17 @@ Or do you want to use the entrypoints '{name}' and '{runtime}' independently on 
       .cloned()
       .unwrap_or_default();
 
+    let discovered_actions_end = self.queue.len();
+    let discovered_actions = parallel::should_process_discovered_actions(
+      self,
+      &self.queue[discovered_actions_start..discovered_actions_end],
+    )
+    .then(|| {
+      self
+        .queue
+        .drain(discovered_actions_start..discovered_actions_end)
+        .collect::<Vec<_>>()
+    });
     for block in blocks {
       self.make_chunk_group(
         block,
@@ -1540,6 +1547,9 @@ Or do you want to use the entrypoints '{name}' and '{runtime}' independently on 
         item.chunk,
         compilation,
       );
+    }
+    if let Some(discovered_actions) = discovered_actions {
+      parallel::process_discovered_actions(self, compilation, discovered_actions);
     }
   }
 
@@ -1856,7 +1866,6 @@ Or do you want to use the entrypoints '{name}' and '{runtime}' independently on 
           chunk: c.chunks[0],
         }),
       ));
-      self.parallel_state.bump_revision(cgi);
     } else if let Some(entrypoint) = entrypoint {
       let item_chunk_group = compilation
         .build_chunk_graph_artifact
@@ -2357,13 +2366,9 @@ Or do you want to use the entrypoints '{name}' and '{runtime}' independently on 
             continue;
           }
 
-          if self.parallel_state.enabled() {
-            self.parallel_state.enqueue(info_ukey, process_block);
-          } else {
-            self
-              .queue_delayed
-              .push(QueueAction::ProcessBlock(process_block));
-          }
+          self
+            .queue_delayed
+            .push(QueueAction::ProcessBlock(process_block));
         }
       }
     }

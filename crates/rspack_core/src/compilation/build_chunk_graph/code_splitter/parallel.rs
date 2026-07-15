@@ -1,79 +1,82 @@
 use std::{ffi::OsStr, sync::Arc};
 
-use itertools::Itertools;
 use num_bigint::BigUint;
 use rayon::prelude::*;
-use rspack_collections::{IdentifierIndexSet, IdentifierMap};
-use rspack_util::fx_hash::{FxIndexMap, FxIndexSet};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rspack_collections::IdentifierMap;
+use rustc_hash::FxHashSet as HashSet;
 
 use super::{
-  BlockConnectionMap, BlockModules, CgiUkey, CodeSplitter, ConnectionIdList,
+  AddAndEnterModule, BlockConnectionMap, BlockModules, CodeSplitter, ConnectionIdList,
   DependenciesBlockIdentifier, DependenciesBlockIdentifierMap, PreparedBlockConnectionMap,
-  ProcessBlock, get_active_state_of_connections,
+  ProcessBlock, QueueAction, extract_block_modules,
 };
 use crate::{
   AsyncDependenciesBlockIdentifier, ChunkUkey, Compilation, ModuleIdentifier, RuntimeSpec,
 };
 
 const PARALLEL_CODE_SPLITTING_ENV: &str = "RSPACK_EXPERIMENTAL_PARALLEL_CODE_SPLITTING";
-const MIN_PARALLEL_CHUNK_GROUPS: usize = 2;
+const MIN_PARALLEL_ACTIONS: usize = 2;
+const MIN_ESTIMATED_CONNECTIONS: usize = 64;
+const MIN_ESTIMATED_CONNECTIONS_PER_ACTION: usize = 16;
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ParallelCodeSplitterState {
   enabled: bool,
-  pending: FxIndexMap<CgiUkey, Vec<ProcessBlock>>,
-  active_jobs: HashSet<CgiUkey>,
-  revisions: HashMap<CgiUkey, u32>,
-  // Runtime-specific connection states are immutable for one build_chunk_graph pass.
-  prepared_runtimes: HashSet<Arc<RuntimeSpec>>,
 }
 
 impl ParallelCodeSplitterState {
   pub(super) fn configure_from_env(&mut self) {
-    // Keep a process-level escape hatch while making the optimized path the default.
     self.enabled = std::env::var_os(PARALLEL_CODE_SPLITTING_ENV)
       .is_none_or(|value| value != OsStr::new("0") && !value.is_empty());
-    if !self.enabled {
-      self.pending.clear();
-      self.active_jobs.clear();
-      self.revisions.clear();
-      self.prepared_runtimes.clear();
-    }
-  }
-
-  pub(super) fn enabled(&self) -> bool {
-    self.enabled
-  }
-
-  pub(super) fn has_pending_work(&self) -> bool {
-    self.enabled && !self.pending.is_empty()
-  }
-
-  pub(super) fn enqueue(&mut self, cgi: CgiUkey, block: ProcessBlock) {
-    self.pending.entry(cgi).or_default().push(block);
-  }
-
-  pub(super) fn bump_revision(&mut self, cgi: CgiUkey) {
-    if self.active_jobs.contains(&cgi) {
-      *self.revisions.entry(cgi).or_default() += 1;
-    }
-  }
-
-  fn revision(&self, cgi: CgiUkey) -> u32 {
-    self.revisions.get(&cgi).copied().unwrap_or_default()
   }
 }
 
-#[derive(Debug)]
-struct ParallelWalkJob {
-  cgi: CgiUkey,
-  chunk: ChunkUkey,
-  roots: Vec<ProcessBlock>,
-  runtime: Arc<RuntimeSpec>,
-  min_available_modules: Arc<BigUint>,
-  chunk_mask: BigUint,
-  revision: u32,
+#[derive(Debug, Clone)]
+enum ParallelRoot {
+  AddModule(AddAndEnterModule),
+  ProcessBlock(ProcessBlock),
+}
+
+impl ParallelRoot {
+  fn from_queue_action(action: QueueAction) -> Self {
+    match action {
+      QueueAction::AddAndEnterModule(item) => Self::AddModule(item),
+      QueueAction::ProcessBlock(item) => Self::ProcessBlock(item),
+      _ => unreachable!("parallel roots only contain module and block actions"),
+    }
+  }
+
+  fn chunk_group_info(&self) -> super::CgiUkey {
+    match self {
+      Self::AddModule(item) => item.chunk_group_info,
+      Self::ProcessBlock(item) => item.chunk_group_info,
+    }
+  }
+
+  fn chunk(&self) -> ChunkUkey {
+    match self {
+      Self::AddModule(item) => item.chunk,
+      Self::ProcessBlock(item) => item.chunk,
+    }
+  }
+
+  fn into_queue_action(self) -> QueueAction {
+    match self {
+      Self::AddModule(item) => QueueAction::AddAndEnterModule(item),
+      Self::ProcessBlock(item) => QueueAction::ProcessBlock(item),
+    }
+  }
+
+  fn to_walk_action(&self) -> WalkAction {
+    match self {
+      Self::AddModule(item) => WalkAction::AddModule(item.module),
+      Self::ProcessBlock(item) => WalkAction::ProcessBlock {
+        block: item.block,
+        module: item.module,
+        queued: true,
+      },
+    }
+  }
 }
 
 #[derive(Debug)]
@@ -81,292 +84,216 @@ enum WalkAction {
   ProcessBlock {
     block: DependenciesBlockIdentifier,
     module: ModuleIdentifier,
+    queued: bool,
   },
   AddModule(ModuleIdentifier),
   LeaveModule(ModuleIdentifier),
 }
 
 #[derive(Debug)]
+struct ParallelWalkJob {
+  root: ParallelRoot,
+  runtime: Arc<RuntimeSpec>,
+  min_available_modules: Arc<BigUint>,
+  chunk_mask: BigUint,
+}
+
+#[derive(Debug)]
 struct ParallelWalkResult {
   job: ParallelWalkJob,
-  resulting_chunk_mask: BigUint,
+  block_modules_cache: BlockConnectionMap,
   modules: Vec<ModuleIdentifier>,
   post_order_modules: Vec<ModuleIdentifier>,
   async_blocks: Vec<(AsyncDependenciesBlockIdentifier, ModuleIdentifier)>,
-  skipped_items: IdentifierIndexSet,
-  skipped_connections: FxIndexSet<(ModuleIdentifier, ConnectionIdList)>,
+  skipped_items: Vec<ModuleIdentifier>,
+  skipped_connections: Vec<(ModuleIdentifier, ConnectionIdList)>,
+  checked_modules: Vec<ModuleIdentifier>,
+  processed_queue_items: u32,
   processed_blocks: u32,
 }
 
-pub(super) fn process_parallel_work(splitter: &mut CodeSplitter, compilation: &mut Compilation) {
-  let pending = std::mem::take(&mut splitter.parallel_state.pending);
-  if pending.is_empty() {
-    return;
+pub(super) fn should_process_discovered_actions(
+  splitter: &CodeSplitter,
+  actions: &[QueueAction],
+) -> bool {
+  if !splitter.parallel_state.enabled
+    || rayon::current_num_threads() <= 1
+    || actions.len() < MIN_PARALLEL_ACTIONS
+  {
+    return false;
   }
-  if pending.len() < MIN_PARALLEL_CHUNK_GROUPS {
-    // A narrow frontier cannot amortize Rayon scheduling or result allocation.
-    for (_, roots) in pending {
-      splitter
-        .queue_delayed
-        .extend(roots.into_iter().map(super::QueueAction::ProcessBlock));
+
+  let Some(first) = actions.first() else {
+    return false;
+  };
+  let first = match first {
+    QueueAction::AddAndEnterModule(item) => (item.chunk_group_info, item.chunk),
+    QueueAction::ProcessBlock(item) => (item.chunk_group_info, item.chunk),
+    _ => return false,
+  };
+  let chunk_group_info = splitter.chunk_group_info(&first.0);
+  if !chunk_group_info.chunk_loading || !chunk_group_info.async_chunks {
+    return false;
+  }
+
+  let mut estimated_connections = 0;
+  for action in actions {
+    let root = match action {
+      QueueAction::AddAndEnterModule(item) => {
+        if (item.chunk_group_info, item.chunk) != first {
+          return false;
+        }
+        item.module
+      }
+      QueueAction::ProcessBlock(item) => {
+        if (item.chunk_group_info, item.chunk) != first {
+          return false;
+        }
+        match item.block {
+          DependenciesBlockIdentifier::Module(module) => module,
+          DependenciesBlockIdentifier::AsyncDependenciesBlock(_) => item.module,
+        }
+      }
+      _ => return false,
+    };
+    let root_estimated_connections = splitter
+      .prepared_connection_map
+      .get(&root)
+      .map_or(0, Vec::len);
+    if root_estimated_connections < MIN_ESTIMATED_CONNECTIONS_PER_ACTION {
+      return false;
     }
-    return;
+    estimated_connections += root_estimated_connections;
   }
+  // A few large roots must not pull a wide-but-shallow batch into Rayon. Require enough total
+  // work and enough independently useful work in every speculative root.
+  estimated_connections >= MIN_ESTIMATED_CONNECTIONS
+}
 
-  splitter
-    .parallel_state
-    .active_jobs
-    .extend(pending.keys().copied());
-
-  // Keep connection-state evaluation out of the worker hot loop. This is shared by all chunk
-  // groups with the same runtime and is usually the highest-cardinality read-only preparation.
-  prepare_runtime_block_modules(splitter, compilation, pending.keys().copied());
-
-  let jobs = pending
+pub(super) fn process_discovered_actions(
+  splitter: &mut CodeSplitter,
+  compilation: &mut Compilation,
+  actions: Vec<QueueAction>,
+) {
+  let mut roots = actions
     .into_iter()
-    .map(|(cgi_ukey, roots)| {
-      let cgi = splitter.chunk_group_info(&cgi_ukey);
-      let chunk = roots
-        .first()
-        .expect("parallel code splitting job should have a root")
-        .chunk;
-      debug_assert!(roots.iter().all(|root| root.chunk == chunk));
+    .map(ParallelRoot::from_queue_action)
+    .collect::<Vec<_>>();
+  // The legacy queue is a stack. Actions were collected in push order, so reverse them to obtain
+  // the exact order in which the legacy algorithm would process them.
+  roots.reverse();
+
+  let jobs = roots
+    .into_iter()
+    .map(|root| {
+      let chunk_group_info = splitter.chunk_group_info(&root.chunk_group_info());
       ParallelWalkJob {
-        cgi: cgi_ukey,
-        chunk,
-        roots,
-        runtime: cgi.runtime.clone(),
-        min_available_modules: cgi.min_available_modules.clone(),
         chunk_mask: splitter
           .mask_by_chunk
-          .get(&chunk)
+          .get(&root.chunk())
           .expect("chunk must be in mask_by_chunk")
           .clone(),
-        revision: splitter.parallel_state.revision(cgi_ukey),
+        runtime: chunk_group_info.runtime.clone(),
+        min_available_modules: chunk_group_info.min_available_modules.clone(),
+        root,
       }
-    })
-    .collect_vec();
-
-  let block_modules_runtime_map = &splitter.block_modules_runtime_map;
-  let prepared_blocks_map = &splitter.prepared_blocks_map;
-  let ordinal_by_module = &splitter.ordinal_by_module;
-  let results = jobs
-    .into_par_iter()
-    .map(|job| {
-      let block_modules = block_modules_runtime_map
-        .get(&Some(job.runtime.clone()))
-        .expect("parallel runtime block modules should be prepared");
-      walk_chunk_group(job, block_modules, prepared_blocks_map, ordinal_by_module)
     })
     .collect::<Vec<_>>();
 
-  let mut accepted_results = Vec::with_capacity(results.len());
-  for mut result in results {
-    // Earlier commits in this wave may have connected another block to the same named chunk group.
-    // Such a result was computed from a stale availability/topology snapshot and must be retried.
-    if result_is_stale(splitter, &result) {
-      let cgi = result.job.cgi;
-      for root in result.job.roots {
-        splitter.parallel_state.enqueue(cgi, root);
-      }
-      continue;
-    }
-
-    commit_walk_topology(splitter, compilation, &mut result);
-    accepted_results.push(result);
-  }
-  commit_walk_results(splitter, compilation, accepted_results);
-  splitter.parallel_state.active_jobs.clear();
-}
-
-fn prepare_runtime_block_modules(
-  splitter: &mut CodeSplitter,
-  compilation: &Compilation,
-  chunk_groups: impl Iterator<Item = CgiUkey>,
-) {
-  let runtimes = chunk_groups
-    .map(|cgi| splitter.chunk_group_info(&cgi).runtime.clone())
-    .unique()
-    .filter(|runtime| !splitter.parallel_state.prepared_runtimes.contains(runtime))
-    .collect_vec();
-
-  for runtime in runtimes {
-    let existing_block_modules = splitter
+  let prepared_blocks_map = &splitter.prepared_blocks_map;
+  let prepared_connection_map = &splitter.prepared_connection_map;
+  let ordinal_by_module = &splitter.ordinal_by_module;
+  let shared_block_modules = jobs.first().and_then(|job| {
+    splitter
       .block_modules_runtime_map
-      .get(&Some(runtime.clone()));
-    let block_modules = splitter
-      .prepared_connection_map
-      .par_iter()
-      .filter(|(module, _)| {
-        existing_block_modules.is_none_or(|block_modules| {
-          !block_modules.contains_key(&DependenciesBlockIdentifier::Module(**module))
-        })
-      })
-      .fold(
-        BlockConnectionMap::default,
-        |mut block_modules, (module, connections)| {
-          prepare_module_block_modules(
-            *module,
-            connections,
-            runtime.as_ref(),
-            compilation,
-            &splitter.prepared_blocks_map,
-            &mut block_modules,
-          );
-          block_modules
-        },
+      .get(&Some(job.runtime.clone()))
+  });
+  let results = jobs
+    .into_par_iter()
+    .map(|job| {
+      walk_root(
+        job,
+        compilation,
+        prepared_blocks_map,
+        prepared_connection_map,
+        ordinal_by_module,
+        shared_block_modules,
       )
-      .reduce(BlockConnectionMap::default, |mut left, right| {
-        left.extend(right);
-        left
-      });
+    })
+    .collect::<Vec<_>>();
 
-    let runtime_block_modules = splitter
-      .block_modules_runtime_map
-      .entry(Some(runtime.clone()))
-      .or_default();
-    runtime_block_modules.extend(block_modules);
-    for block in splitter.prepared_blocks_map.keys() {
-      runtime_block_modules
-        .entry(*block)
-        .or_insert_with(|| Arc::new(Vec::new()));
-    }
-    splitter.parallel_state.prepared_runtimes.insert(runtime);
-  }
+  commit_results(splitter, compilation, results);
 }
 
-fn prepare_module_block_modules(
-  module: ModuleIdentifier,
-  connections: &PreparedBlockConnectionMap,
-  runtime: &RuntimeSpec,
+fn walk_root(
+  job: ParallelWalkJob,
   compilation: &Compilation,
   prepared_blocks_map: &DependenciesBlockIdentifierMap<Vec<AsyncDependenciesBlockIdentifier>>,
-  block_modules: &mut BlockConnectionMap,
-) {
-  let root = DependenciesBlockIdentifier::Module(module);
-  let nested_blocks = prepared_blocks_map
-    .get(&root)
-    .map(Vec::as_slice)
-    .unwrap_or_default();
-
-  if nested_blocks.is_empty() {
-    let modules = connections
-      .iter()
-      .map(|connection| {
-        debug_assert_eq!(connection.block, root);
-        let active_state = get_active_state_of_connections(
-          &connection.connections,
-          Some(runtime),
-          compilation.get_module_graph(),
-          &compilation.module_graph_cache_artifact,
-          &compilation
-            .build_module_graph_artifact
-            .side_effects_state_artifact,
-          &compilation.exports_info_artifact,
-        );
-        (
-          connection.module,
-          active_state,
-          connection.connections.clone(),
-        )
-      })
-      .collect();
-    block_modules.insert(root, Arc::new(modules));
-    return;
-  }
-
-  let mut modules_by_block =
-    DependenciesBlockIdentifierMap::<BlockModules>::with_capacity_and_hasher(
-      nested_blocks.len() + 1,
-      Default::default(),
-    );
-  modules_by_block.insert(root, Vec::new());
-  modules_by_block.extend(nested_blocks.iter().map(|block| {
-    (
-      DependenciesBlockIdentifier::AsyncDependenciesBlock(*block),
-      Vec::new(),
-    )
-  }));
-
-  for connection in connections {
-    let active_state = get_active_state_of_connections(
-      &connection.connections,
-      Some(runtime),
-      compilation.get_module_graph(),
-      &compilation.module_graph_cache_artifact,
-      &compilation
-        .build_module_graph_artifact
-        .side_effects_state_artifact,
-      &compilation.exports_info_artifact,
-    );
-    modules_by_block.entry(connection.block).or_default().push((
-      connection.module,
-      active_state,
-      connection.connections.clone(),
-    ));
-  }
-
-  block_modules.extend(
-    modules_by_block
-      .into_iter()
-      .map(|(block, modules)| (block, Arc::new(modules))),
-  );
-}
-
-fn walk_chunk_group(
-  job: ParallelWalkJob,
-  block_modules: &BlockConnectionMap,
-  prepared_blocks_map: &DependenciesBlockIdentifierMap<Vec<AsyncDependenciesBlockIdentifier>>,
+  prepared_connection_map: &IdentifierMap<PreparedBlockConnectionMap>,
   ordinal_by_module: &IdentifierMap<u64>,
+  shared_block_modules: Option<&BlockConnectionMap>,
 ) -> ParallelWalkResult {
-  let mut actions = Vec::with_capacity(job.roots.len());
-  for root in job.roots.iter().rev() {
-    actions.push(WalkAction::ProcessBlock {
-      block: root.block,
-      module: root.module,
-    });
-  }
-
+  let mut actions = vec![job.root.to_walk_action()];
   let mut chunk_mask = job.chunk_mask.clone();
+  let mut block_modules_cache = BlockConnectionMap::default();
+  let mut visited_blocks = HashSet::default();
   let mut modules = Vec::new();
   let mut post_order_modules = Vec::new();
   let mut async_blocks = Vec::new();
-  let mut skipped_items = IdentifierIndexSet::default();
-  let mut skipped_connections = FxIndexSet::default();
-  let mut visited_blocks = HashSet::default();
+  let mut skipped_items = Vec::new();
+  let mut skipped_connections = Vec::new();
+  let mut checked_modules = Vec::new();
+  let mut processed_queue_items = 0;
   let mut processed_blocks = 0;
 
   while let Some(action) = actions.pop() {
     match action {
-      WalkAction::ProcessBlock { block, module } => {
+      WalkAction::ProcessBlock {
+        block,
+        module,
+        queued,
+      } => {
+        if queued {
+          processed_queue_items += 1;
+        }
+        processed_blocks += 1;
         if !visited_blocks.insert(block) {
           continue;
         }
-        processed_blocks += 1;
-        if let Some(modules) = block_modules.get(&block) {
-          for (target, active_state, connections) in modules.iter().rev() {
-            let ordinal = *ordinal_by_module.get(target).unwrap_or_else(|| {
-              panic!("expected a module ordinal for identifier '{target}', but none was found")
-            });
-            if chunk_mask.bit(ordinal) {
+
+        let block_modules = get_block_modules(
+          block,
+          &job.runtime,
+          compilation,
+          prepared_blocks_map,
+          prepared_connection_map,
+          shared_block_modules,
+          &mut block_modules_cache,
+        );
+        for (target, active_state, connections) in block_modules.iter().rev() {
+          let ordinal = *ordinal_by_module.get(target).unwrap_or_else(|| {
+            panic!("expected a module ordinal for identifier '{target}', but none was found")
+          });
+          if chunk_mask.bit(ordinal) {
+            continue;
+          }
+          checked_modules.push(*target);
+          if !active_state.is_true() {
+            skipped_connections.push((*target, connections.clone()));
+            if active_state.is_false() {
               continue;
             }
-            if !active_state.is_true() {
-              skipped_connections.insert((*target, connections.clone()));
-              if active_state.is_false() {
-                continue;
-              }
-            }
-            if active_state.is_true() && job.min_available_modules.bit(ordinal) {
-              skipped_items.insert(*target);
-            } else if active_state.is_true() {
-              actions.push(WalkAction::AddModule(*target));
-            } else {
-              actions.push(WalkAction::ProcessBlock {
-                block: DependenciesBlockIdentifier::Module(*target),
-                module,
-              });
-            }
+          }
+          if active_state.is_true() && job.min_available_modules.bit(ordinal) {
+            skipped_items.push(*target);
+          } else if active_state.is_true() {
+            actions.push(WalkAction::AddModule(*target));
+          } else {
+            actions.push(WalkAction::ProcessBlock {
+              block: DependenciesBlockIdentifier::Module(*target),
+              module,
+              queued: true,
+            });
           }
         }
 
@@ -375,140 +302,230 @@ fn walk_chunk_group(
         }
       }
       WalkAction::AddModule(module) => {
+        processed_queue_items += 1;
         let ordinal = *ordinal_by_module.get(&module).unwrap_or_else(|| {
           panic!("expected a module ordinal for identifier '{module}', but none was found")
         });
         if chunk_mask.bit(ordinal) {
           continue;
         }
+        checked_modules.push(module);
         if job.min_available_modules.bit(ordinal) {
-          skipped_items.insert(module);
+          skipped_items.push(module);
           continue;
         }
-        chunk_mask.set_bit(ordinal, true);
+
         modules.push(module);
+        chunk_mask.set_bit(ordinal, true);
         actions.push(WalkAction::LeaveModule(module));
         actions.push(WalkAction::ProcessBlock {
           block: DependenciesBlockIdentifier::Module(module),
           module,
+          queued: false,
         });
       }
-      WalkAction::LeaveModule(module) => post_order_modules.push(module),
+      WalkAction::LeaveModule(module) => {
+        processed_queue_items += 1;
+        post_order_modules.push(module);
+      }
     }
   }
 
   ParallelWalkResult {
     job,
-    resulting_chunk_mask: chunk_mask,
+    block_modules_cache,
     modules,
     post_order_modules,
     async_blocks,
     skipped_items,
     skipped_connections,
+    checked_modules,
+    processed_queue_items,
     processed_blocks,
   }
 }
 
-fn result_is_stale(splitter: &CodeSplitter, result: &ParallelWalkResult) -> bool {
-  let cgi = splitter.chunk_group_info(&result.job.cgi);
-  cgi.min_available_modules.as_ref() != result.job.min_available_modules.as_ref()
-    || cgi.runtime.as_ref() != result.job.runtime.as_ref()
-    || splitter.parallel_state.revision(result.job.cgi) != result.job.revision
-    || splitter
-      .mask_by_chunk
-      .get(&result.job.chunk)
-      .expect("chunk must be in mask_by_chunk")
-      != &result.job.chunk_mask
-}
-
-fn commit_walk_topology(
-  splitter: &mut CodeSplitter,
-  compilation: &mut Compilation,
-  result: &mut ParallelWalkResult,
-) {
-  splitter.stat_processed_blocks += result.processed_blocks;
-  let cgi_ukey = result.job.cgi;
-  let chunk = result.job.chunk;
-
-  *splitter
-    .mask_by_chunk
-    .get_mut(&chunk)
-    .expect("chunk must be in mask_by_chunk") = std::mem::take(&mut result.resulting_chunk_mask);
-
-  for (block, module) in std::mem::take(&mut result.async_blocks) {
-    splitter.make_chunk_group(block, module, cgi_ukey, chunk, compilation);
+fn get_block_modules(
+  block: DependenciesBlockIdentifier,
+  runtime: &Arc<RuntimeSpec>,
+  compilation: &Compilation,
+  prepared_blocks_map: &DependenciesBlockIdentifierMap<Vec<AsyncDependenciesBlockIdentifier>>,
+  prepared_connection_map: &IdentifierMap<PreparedBlockConnectionMap>,
+  shared_block_modules: Option<&BlockConnectionMap>,
+  cache: &mut BlockConnectionMap,
+) -> Arc<BlockModules> {
+  if let Some(block_modules) = cache.get(&block) {
+    return block_modules.clone();
+  }
+  if let Some(block_modules) = shared_block_modules.and_then(|cache| cache.get(&block)) {
+    return block_modules.clone();
   }
 
-  splitter.parallel_state.bump_revision(cgi_ukey);
+  let root = block.get_root_block(compilation.get_module_graph());
+  extract_block_modules(
+    root,
+    Some(runtime.clone()),
+    compilation,
+    prepared_blocks_map,
+    prepared_connection_map,
+    cache,
+  );
+  cache
+    .get(&block)
+    .cloned()
+    .unwrap_or_else(|| Arc::new(Vec::new()))
 }
 
-fn commit_walk_results(
+fn result_is_stale(splitter: &CodeSplitter, result: &ParallelWalkResult) -> bool {
+  let chunk_group_info = splitter.chunk_group_info(&result.job.root.chunk_group_info());
+  if chunk_group_info.min_available_modules.as_ref() != result.job.min_available_modules.as_ref()
+    || chunk_group_info.runtime.as_ref() != result.job.runtime.as_ref()
+  {
+    return true;
+  }
+
+  let chunk_mask = splitter
+    .mask_by_chunk
+    .get(&result.job.root.chunk())
+    .expect("chunk must be in mask_by_chunk");
+  result.checked_modules.iter().any(|module| {
+    let ordinal = splitter.ordinal_by_module.get(module).unwrap_or_else(|| {
+      panic!("expected a module ordinal for identifier '{module}', but none was found")
+    });
+    chunk_mask.bit(*ordinal)
+  })
+}
+
+fn commit_results(
   splitter: &mut CodeSplitter,
   compilation: &mut Compilation,
   results: Vec<ParallelWalkResult>,
 ) {
-  {
-    let chunk_graph = &mut compilation.build_chunk_graph_artifact.chunk_graph;
-    for result in &results {
-      chunk_graph.connect_chunk_and_modules(result.job.chunk, &result.modules);
-    }
+  for result in &results {
+    cache_block_modules(splitter, result);
   }
 
+  let mut results = results.into_iter();
+  while let Some(result) = results.next() {
+    if result_is_stale(splitter, &result) {
+      let mut roots = vec![result.job.root];
+      roots.extend(results.map(|result| result.job.root));
+      splitter
+        .queue
+        .extend(roots.into_iter().rev().map(ParallelRoot::into_queue_action));
+      return;
+    }
+    commit_result(splitter, compilation, result);
+  }
+}
+
+fn cache_block_modules(splitter: &mut CodeSplitter, result: &ParallelWalkResult) {
+  let chunk_group_info = splitter.chunk_group_info(&result.job.root.chunk_group_info());
+  if chunk_group_info.runtime.as_ref() != result.job.runtime.as_ref() {
+    return;
+  }
+
+  let runtime_cache = splitter
+    .block_modules_runtime_map
+    .entry(Some(result.job.runtime.clone()))
+    .or_default();
+  for (block, modules) in &result.block_modules_cache {
+    runtime_cache
+      .entry(*block)
+      .or_insert_with(|| modules.clone());
+  }
+}
+
+fn commit_result(
+  splitter: &mut CodeSplitter,
+  compilation: &mut Compilation,
+  result: ParallelWalkResult,
+) {
+  let ParallelWalkResult {
+    job,
+    modules,
+    post_order_modules,
+    async_blocks,
+    skipped_items,
+    skipped_connections,
+    processed_queue_items,
+    processed_blocks,
+    ..
+  } = result;
+  let chunk_group_info = job.root.chunk_group_info();
+  let chunk = job.root.chunk();
+
+  splitter.stat_processed_queue_items += processed_queue_items;
+  splitter.stat_processed_blocks += processed_blocks;
+
+  compilation
+    .build_chunk_graph_artifact
+    .chunk_graph
+    .connect_chunk_and_modules(chunk, &modules);
+  let chunk_mask = splitter
+    .mask_by_chunk
+    .get_mut(&chunk)
+    .expect("chunk must be in mask_by_chunk");
+  for module in &modules {
+    let ordinal = splitter.ordinal_by_module.get(module).unwrap_or_else(|| {
+      panic!("expected a module ordinal for identifier '{module}', but none was found")
+    });
+    chunk_mask.set_bit(*ordinal, true);
+  }
+
+  let chunk_group_ukey = splitter.chunk_group_info(&chunk_group_info).chunk_group;
   {
-    let chunk_group_by_ukey = &mut compilation.build_chunk_graph_artifact.chunk_group_by_ukey;
-    for result in &results {
-      let chunk_group_ukey = splitter.chunk_group_info(&result.job.cgi).chunk_group;
-      let chunk_group = chunk_group_by_ukey.expect_get_mut(&chunk_group_ukey);
-      chunk_group
-        .module_pre_order_indices
-        .reserve(result.modules.len());
-      for module in &result.modules {
-        if let std::collections::hash_map::Entry::Vacant(entry) =
-          chunk_group.module_pre_order_indices.entry(*module)
-        {
-          entry.insert(chunk_group.next_pre_order_index);
-          chunk_group.next_pre_order_index += 1;
-        }
+    let chunk_group = compilation
+      .build_chunk_graph_artifact
+      .chunk_group_by_ukey
+      .expect_get_mut(&chunk_group_ukey);
+    chunk_group.module_pre_order_indices.reserve(modules.len());
+    for module in &modules {
+      if let std::collections::hash_map::Entry::Vacant(entry) =
+        chunk_group.module_pre_order_indices.entry(*module)
+      {
+        entry.insert(chunk_group.next_pre_order_index);
+        chunk_group.next_pre_order_index += 1;
       }
-      chunk_group
-        .module_post_order_indices
-        .reserve(result.post_order_modules.len());
-      for module in &result.post_order_modules {
-        if let std::collections::hash_map::Entry::Vacant(entry) =
-          chunk_group.module_post_order_indices.entry(*module)
-        {
-          entry.insert(chunk_group.next_post_order_index);
-          chunk_group.next_post_order_index += 1;
-        }
+    }
+    chunk_group
+      .module_post_order_indices
+      .reserve(post_order_modules.len());
+    for module in &post_order_modules {
+      if let std::collections::hash_map::Entry::Vacant(entry) =
+        chunk_group.module_post_order_indices.entry(*module)
+      {
+        entry.insert(chunk_group.next_post_order_index);
+        chunk_group.next_post_order_index += 1;
       }
     }
   }
 
   {
     let module_graph = compilation.get_module_graph_mut();
-    for result in &results {
-      for module in &result.modules {
-        let module_graph_module = module_graph.module_graph_module_by_identifier_mut(module);
-        if module_graph_module.pre_order_index.is_none() {
-          module_graph_module.pre_order_index = Some(splitter.next_free_module_pre_order_index);
-          splitter.next_free_module_pre_order_index += 1;
-        }
+    for module in &modules {
+      let module_graph_module = module_graph.module_graph_module_by_identifier_mut(module);
+      if module_graph_module.pre_order_index.is_none() {
+        module_graph_module.pre_order_index = Some(splitter.next_free_module_pre_order_index);
+        splitter.next_free_module_pre_order_index += 1;
       }
-      for module in &result.post_order_modules {
-        let module_graph_module = module_graph.module_graph_module_by_identifier_mut(module);
-        if module_graph_module.post_order_index.is_none() {
-          module_graph_module.post_order_index = Some(splitter.next_free_module_post_order_index);
-          splitter.next_free_module_post_order_index += 1;
-        }
+    }
+    for module in &post_order_modules {
+      let module_graph_module = module_graph.module_graph_module_by_identifier_mut(module);
+      if module_graph_module.post_order_index.is_none() {
+        module_graph_module.post_order_index = Some(splitter.next_free_module_post_order_index);
+        splitter.next_free_module_post_order_index += 1;
       }
     }
   }
 
-  for result in results {
-    let cgi = splitter.chunk_group_info_mut(&result.job.cgi);
-    cgi.skipped_items.extend(result.skipped_items);
-    cgi
-      .skipped_module_connections
-      .extend(result.skipped_connections);
+  for (block, module) in async_blocks {
+    splitter.make_chunk_group(block, module, chunk_group_info, chunk, compilation);
   }
+
+  let chunk_group_info = splitter.chunk_group_info_mut(&chunk_group_info);
+  chunk_group_info.skipped_items.extend(skipped_items);
+  chunk_group_info
+    .skipped_module_connections
+    .extend(skipped_connections);
 }

@@ -20,8 +20,9 @@ use serde_json::json;
 use crate::groups::diagnostics::assert_no_compilation_errors;
 
 pub(crate) static NUM_MODULES: usize = 10000;
-const WIDE_CHUNK_GROUPS: usize = 128;
-const WIDE_MODULES_PER_GROUP: usize = 128;
+const WIDE_CHUNK_GROUPS: usize = 64;
+const WIDE_BRANCHES_PER_GROUP: usize = 8;
+const WIDE_LEAVES_PER_BRANCH: usize = 16;
 
 pub(crate) async fn prepare_large_code_splitting_case(
   num: usize,
@@ -43,7 +44,8 @@ pub(crate) async fn prepare_large_code_splitting_case(
 
 async fn prepare_wide_code_splitting_case(
   groups: usize,
-  modules_per_group: usize,
+  branches_per_group: usize,
+  leaves_per_branch: usize,
   fs: &MemoryFileSystem,
 ) {
   fs.create_dir_all("/src".into()).await.unwrap();
@@ -53,22 +55,45 @@ async fn prepare_wide_code_splitting_case(
   for group in 0..groups {
     entry.push_str(&format!("import('/src/wide/group-{group}.js');\n"));
     let mut group_source = String::new();
-    for module in 0..modules_per_group {
-      let module_id = group * modules_per_group + module;
+    for branch in 0..branches_per_group {
       group_source.push_str(&format!(
-        "import value{module} from '/src/wide/leaf-{module_id}.js';\n"
+        "import value{branch} from '/src/wide/group-{group}-branch-{branch}.js';\n"
       ));
+
+      let mut branch_source = String::new();
+      for leaf in 0..leaves_per_branch {
+        let leaf_id = (group * branches_per_group + branch) * leaves_per_branch + leaf;
+        branch_source.push_str(&format!(
+          "import value{leaf} from '/src/wide/leaf-{leaf_id}.js';\n"
+        ));
+        fs.write(
+          format!("/src/wide/leaf-{leaf_id}.js").as_str().into(),
+          format!("export default {leaf_id};").as_bytes(),
+        )
+        .await
+        .unwrap();
+      }
+      branch_source.push_str("export default ");
+      branch_source.push_str(
+        &(0..leaves_per_branch)
+          .map(|leaf| format!("value{leaf}"))
+          .collect::<Vec<_>>()
+          .join(" + "),
+      );
+      branch_source.push_str(";\n");
       fs.write(
-        format!("/src/wide/leaf-{module_id}.js").as_str().into(),
-        format!("export default {module_id};").as_bytes(),
+        format!("/src/wide/group-{group}-branch-{branch}.js")
+          .as_str()
+          .into(),
+        branch_source.as_bytes(),
       )
       .await
       .unwrap();
     }
     group_source.push_str("export default ");
     group_source.push_str(
-      &(0..modules_per_group)
-        .map(|module| format!("value{module}"))
+      &(0..branches_per_group)
+        .map(|branch| format!("value{branch}"))
         .collect::<Vec<_>>()
         .join(" + "),
     );
@@ -256,7 +281,13 @@ pub fn build_chunk_graph_benchmark_inner(c: &mut Criterion) {
     .unwrap();
   reset_compilation_state(&mut wide_compiler);
   rt.block_on(async {
-    prepare_wide_code_splitting_case(WIDE_CHUNK_GROUPS, WIDE_MODULES_PER_GROUP, &wide_fs).await;
+    prepare_wide_code_splitting_case(
+      WIDE_CHUNK_GROUPS,
+      WIDE_BRANCHES_PER_GROUP,
+      WIDE_LEAVES_PER_BRANCH,
+      &wide_fs,
+    )
+    .await;
     prepare_chunk_graph_compilation(&mut wide_compiler).await;
   });
   register_build_chunk_graph_benchmark(
