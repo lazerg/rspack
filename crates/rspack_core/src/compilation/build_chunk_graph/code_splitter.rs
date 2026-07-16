@@ -989,12 +989,13 @@ Or do you want to use the entrypoints '{name}' and '{runtime}' independently on 
         self.process_outdated_chunk_group_info(compilation);
       }
 
-      if self.queue.is_empty() {
+      if self.queue.is_empty() && !parallel::try_process_delayed_queue(self, compilation) {
         let queue_delay = std::mem::take(&mut self.queue_delayed);
         self.queue = queue_delay;
         self.queue.reverse();
       }
     }
+    parallel::log_stats(self);
     logger.time_end(start);
 
     let start = logger.time("extend chunkGroup runtime");
@@ -1474,7 +1475,6 @@ Or do you want to use the entrypoints '{name}' and '{runtime}' independently on 
       compilation,
     );
 
-    let discovered_actions_start = self.queue.len();
     for (module, active_state, connections) in block_modules.iter().rev() {
       if compilation
         .build_chunk_graph_artifact
@@ -1528,17 +1528,6 @@ Or do you want to use the entrypoints '{name}' and '{runtime}' independently on 
       .cloned()
       .unwrap_or_default();
 
-    let discovered_actions_end = self.queue.len();
-    let discovered_actions = parallel::should_process_discovered_actions(
-      self,
-      &self.queue[discovered_actions_start..discovered_actions_end],
-    )
-    .then(|| {
-      self
-        .queue
-        .drain(discovered_actions_start..discovered_actions_end)
-        .collect::<Vec<_>>()
-    });
     for block in blocks {
       self.make_chunk_group(
         block,
@@ -1547,9 +1536,6 @@ Or do you want to use the entrypoints '{name}' and '{runtime}' independently on 
         item.chunk,
         compilation,
       );
-    }
-    if let Some(discovered_actions) = discovered_actions {
-      parallel::process_discovered_actions(self, compilation, discovered_actions);
     }
   }
 
