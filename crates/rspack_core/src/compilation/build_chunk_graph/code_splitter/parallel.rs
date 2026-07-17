@@ -12,7 +12,6 @@ use super::{
 };
 use crate::{AsyncDependenciesBlockIdentifier, Compilation, ModuleIdentifier, RuntimeSpec};
 
-const PARALLEL_CODE_SPLITTING_ENV: &str = "RSPACK_EXPERIMENTAL_PARALLEL_CODE_SPLITTING";
 const PARALLEL_CODE_SPLITTING_STATS_ENV: &str = "RSPACK_EXPERIMENTAL_PARALLEL_CODE_SPLITTING_STATS";
 const MIN_PARALLEL_CHUNK_GROUPS: usize = 2;
 
@@ -64,7 +63,6 @@ struct ParallelCodeSplitterStats {
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ParallelCodeSplitterState {
-  enabled: bool,
   stats_enabled: bool,
   stats: ParallelCodeSplitterStats,
   checked_pre_order_modules: IdentifierSet,
@@ -72,9 +70,7 @@ pub(super) struct ParallelCodeSplitterState {
 }
 
 impl ParallelCodeSplitterState {
-  pub(super) fn configure_from_env(&mut self) {
-    self.enabled = std::env::var_os(PARALLEL_CODE_SPLITTING_ENV)
-      .is_none_or(|value| value != OsStr::new("0") && !value.is_empty());
+  pub(super) fn configure_stats_from_env(&mut self) {
     self.stats_enabled = std::env::var_os(PARALLEL_CODE_SPLITTING_STATS_ENV)
       .is_some_and(|value| value != OsStr::new("0") && !value.is_empty());
     self.stats = Default::default();
@@ -189,8 +185,7 @@ pub(super) fn try_process_delayed_queue(
   splitter: &mut CodeSplitter,
   compilation: &mut Compilation,
 ) -> bool {
-  if !splitter.parallel_state.enabled
-    || rayon::current_num_threads() <= 1
+  if rayon::current_num_threads() <= 1
     || splitter.queue_delayed.len() < MIN_PARALLEL_CHUNK_GROUPS
     || !has_parallel_batch(splitter)
   {

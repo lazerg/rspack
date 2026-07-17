@@ -411,7 +411,7 @@ fn get_active_state_of_connections(
 
 impl CodeSplitter {
   pub(crate) fn configure_parallel_stats(&mut self) {
-    self.parallel_state.configure_from_env();
+    self.parallel_state.configure_stats_from_env();
   }
 
   pub(crate) fn stats_start(&self) -> Option<Instant> {
