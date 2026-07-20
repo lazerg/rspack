@@ -3110,6 +3110,11 @@ export type Experiments = {
    */
   futureDefaults?: boolean;
   /**
+   * Enable the faster module concatenation implementation.
+   * @default false
+   */
+  fasterModuleConcatenation?: boolean;
+  /**
    * Enable loading of modules via HTTP/HTTPS requests.
    * @default false
    */

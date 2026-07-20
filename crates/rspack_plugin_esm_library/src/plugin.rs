@@ -450,7 +450,7 @@ async fn finish_modules(
 #[plugin_hook(CompilationConcatenationScope for EsmLibraryPlugin)]
 async fn concatenation_scope(
   &self,
-  _compilation: &Compilation,
+  compilation: &Compilation,
   module: ModuleIdentifier,
 ) -> Result<Option<ConcatenationScope>> {
   let modules_map = self.concatenated_modules_map_for_codegen.borrow();
@@ -465,6 +465,7 @@ async fn concatenation_scope(
     current_module.module,
     modules_map.clone(),
     current_module.as_ref().clone(),
+    compilation.options.experiments.faster_module_concatenation,
   );
   Ok(Some(scope))
 }
