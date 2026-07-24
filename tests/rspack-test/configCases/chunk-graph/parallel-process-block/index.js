@@ -1,4 +1,4 @@
-it("should rewalk parallel sibling blocks when available modules change", async () => {
+it("should rewalk parallel sibling blocks across entries when available modules change", async () => {
 	const first = await (await import("./module-b")).default;
 	const second = await import(
 		/* webpackChunkName: "parallel-module" */ "./module-a"

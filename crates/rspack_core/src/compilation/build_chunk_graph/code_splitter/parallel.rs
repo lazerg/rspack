@@ -12,6 +12,7 @@ use super::{
 };
 use crate::{AsyncDependenciesBlockIdentifier, Compilation, ModuleIdentifier, RuntimeSpec};
 
+const PARALLEL_CODE_SPLITTING_ENV: &str = "RSPACK_EXPERIMENTAL_PARALLEL_CODE_SPLITTING";
 const PARALLEL_CODE_SPLITTING_STATS_ENV: &str = "RSPACK_EXPERIMENTAL_PARALLEL_CODE_SPLITTING_STATS";
 const MIN_PARALLEL_CHUNK_GROUPS: usize = 2;
 
@@ -63,14 +64,21 @@ struct ParallelCodeSplitterStats {
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct ParallelCodeSplitterState {
+  enabled: bool,
   stats_enabled: bool,
   stats: ParallelCodeSplitterStats,
   checked_pre_order_modules: IdentifierSet,
   checked_post_order_modules: IdentifierSet,
 }
 
+fn is_parallel_code_splitting_enabled(value: Option<&OsStr>) -> bool {
+  value.is_none_or(|value| value != OsStr::new("0") && !value.is_empty())
+}
+
 impl ParallelCodeSplitterState {
-  pub(super) fn configure_stats_from_env(&mut self) {
+  pub(super) fn configure_from_env(&mut self) {
+    self.enabled =
+      is_parallel_code_splitting_enabled(std::env::var_os(PARALLEL_CODE_SPLITTING_ENV).as_deref());
     self.stats_enabled = std::env::var_os(PARALLEL_CODE_SPLITTING_STATS_ENV)
       .is_some_and(|value| value != OsStr::new("0") && !value.is_empty());
     self.stats = Default::default();
@@ -132,6 +140,16 @@ enum WalkAction {
   LeaveModule(ModuleIdentifier),
 }
 
+#[derive(Default)]
+struct VisitedBlocks(HashSet<(DependenciesBlockIdentifier, ModuleIdentifier)>);
+
+impl VisitedBlocks {
+  #[inline]
+  fn insert(&mut self, block: DependenciesBlockIdentifier, module: ModuleIdentifier) -> bool {
+    self.0.insert((block, module))
+  }
+}
+
 #[derive(Debug)]
 struct ParallelWalkResult {
   job: ParallelWalkJob,
@@ -185,7 +203,8 @@ pub(super) fn try_process_delayed_queue(
   splitter: &mut CodeSplitter,
   compilation: &mut Compilation,
 ) -> bool {
-  if rayon::current_num_threads() <= 1
+  if !splitter.parallel_state.enabled
+    || rayon::current_num_threads() <= 1
     || splitter.queue_delayed.len() < MIN_PARALLEL_CHUNK_GROUPS
     || !has_parallel_batch(splitter)
   {
@@ -344,7 +363,7 @@ fn walk_root(
   }];
   let mut chunk_mask = job.chunk_mask.clone();
   let mut block_modules_cache = BlockConnectionMap::default();
-  let mut visited_blocks = HashSet::default();
+  let mut visited_blocks = VisitedBlocks::default();
   let mut modules = Vec::new();
   let mut post_order_modules = Vec::new();
   let mut async_blocks = Vec::new();
@@ -364,7 +383,7 @@ fn walk_root(
           processed_queue_items += 1;
         }
         processed_blocks += 1;
-        if !visited_blocks.insert(block) {
+        if !visited_blocks.insert(block, module) {
           continue;
         }
 
@@ -731,7 +750,10 @@ fn commit_async_blocks(
     if let Some(target_cgi) = target_cgi
       && !splitter.prepared_async_entrypoints.contains(&block)
     {
-      debug_assert_eq!(splitter.edges.get(&block), Some(&module));
+      // `make_chunk_group` updates this edge before handling an existing block. Keep the same
+      // last-writer semantics when using the batched fast path because a transitive walk can reach
+      // the same block with a different module context.
+      splitter.edges.insert(block, module);
       let target_chunk_group = splitter.chunk_group_info(&target_cgi).chunk_group;
       let target_chunk = compilation
         .build_chunk_graph_artifact
@@ -888,4 +910,35 @@ pub(super) fn log_stats(splitter: &CodeSplitter) {
     stats.async_blocks_time_ns as f64 / 1_000_000.0,
     stats.skipped_items_time_ns as f64 / 1_000_000.0,
   );
+}
+
+#[cfg(test)]
+mod tests {
+  use std::ffi::OsStr;
+
+  use super::{
+    DependenciesBlockIdentifier, ModuleIdentifier, VisitedBlocks,
+    is_parallel_code_splitting_enabled,
+  };
+
+  #[test]
+  fn parallel_code_splitting_is_enabled_by_default_with_an_opt_out() {
+    assert!(is_parallel_code_splitting_enabled(None));
+    assert!(is_parallel_code_splitting_enabled(Some(OsStr::new("1"))));
+    assert!(!is_parallel_code_splitting_enabled(Some(OsStr::new("0"))));
+    assert!(!is_parallel_code_splitting_enabled(Some(OsStr::new(""))));
+  }
+
+  #[test]
+  fn visited_blocks_include_the_module_context() {
+    let block =
+      DependenciesBlockIdentifier::Module(ModuleIdentifier::from("shared dependencies block"));
+    let first_module = ModuleIdentifier::from("first module");
+    let second_module = ModuleIdentifier::from("second module");
+    let mut visited_blocks = VisitedBlocks::default();
+
+    assert!(visited_blocks.insert(block, first_module));
+    assert!(visited_blocks.insert(block, second_module));
+    assert!(!visited_blocks.insert(block, first_module));
+  }
 }
